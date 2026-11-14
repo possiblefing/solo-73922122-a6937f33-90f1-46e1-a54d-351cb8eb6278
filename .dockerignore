@@ -1,0 +1,14 @@
+# Build context is the repository root; keep the image lean.
+.git/
+.gitignore
+.dockerignore
+db/
+tests/
+README.md
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+.venv/
+venv/
+.DS_Store

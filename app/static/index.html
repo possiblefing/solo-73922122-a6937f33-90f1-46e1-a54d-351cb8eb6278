@@ -39,6 +39,10 @@
   .pill.timeout  { background:rgba(245,158,11,.18); color:var(--warn); }
   .pill.error    { background:rgba(239,68,68,.18); color:var(--err); }
   .pill.canceled { background:rgba(168,85,247,.18); color:var(--cancel); }
+  .pill.updated    { background:rgba(34,197,94,.18); color:var(--ok); }
+  .pill.idempotent { background:rgba(56,189,248,.18); color:var(--run); }
+  .pill.conflict   { background:rgba(239,68,68,.18); color:var(--err); }
+  h2 { margin:0 0 12px; font-size:16px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { padding:9px 10px; text-align:left; border-bottom:1px solid var(--line);
            font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -48,14 +52,15 @@
   @keyframes flash { from { background:rgba(56,189,248,.18);} to { background:transparent;} }
   .status-line { font-size:15px; margin-bottom:6px; }
   .muted { color:var(--muted); }
-  #msg { margin-top:10px; font-size:13px; min-height:20px; }
-  #msg.err { color:var(--err); } #msg.ok { color:var(--ok); }
+  #msg, #cmsg { margin-top:10px; font-size:13px; min-height:20px; }
+  #msg.err, #cmsg.err { color:var(--err); } #msg.ok, #cmsg.ok { color:var(--ok); }
+  #cmsg.warn { color:var(--warn); }
 </style>
 </head>
 <body>
 <header>
   <h1>夜间门店日结 · 取数负载回放</h1>
-  <p>上传取数日志 CSV（最多 50 行），按相对到达毫秒真实回放只读查询；全站同一时刻只跑一轮，连接池上限 2，单请求 3 秒（含排队）。</p>
+  <p>上传取数日志 CSV（最多 50 行），按相对到达毫秒真实回放只读查询；全站同一时刻只跑一轮，连接池上限 2，单请求 3 秒（含排队）。支持销售补正（最多 20 行，与回放互斥）。</p>
 </header>
 <main>
   <div class="card">
@@ -67,6 +72,18 @@
     </div>
     <div class="hint">列：<code>arrival_ms,template,store</code>；模板：<code>q1_daily_summary</code>（快）、<code>q2_settlement_audit</code>（慢，约 2–3 秒）。</div>
     <div id="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>销售补正</h2>
+    <div class="row">
+      <input type="file" id="cfile" accept=".csv,text/csv" />
+      <button id="corrBtn">提交补正</button>
+      <a class="ghost" href="/samples/correction.csv" download style="padding:9px 14px;border:1px solid var(--line);border-radius:8px;">下载补正样例 CSV</a>
+    </div>
+    <div class="hint">列：<code>sale_id,revision,amount</code>（金额与修订须一起提交），最多 20 行；修订为正整数、金额为非负两位小数；仅更高修订覆盖，同版同额重试幂等成功；旧版、同版异值或销售行不存在则<b>整批拒绝</b>。补正与回放互斥。</div>
+    <div id="cmsg"></div>
+    <div id="cresult" style="margin-top:10px;"></div>
   </div>
 
   <div class="card">
@@ -108,6 +125,9 @@ function render(state) {
   $("cancelBtn").disabled = !running;
   $("startBtn").disabled = running;
   $("file").disabled = running;
+  // 补正与回放互斥：回放运行时禁用补正入口（后端同样强制）。
+  $("corrBtn").disabled = running;
+  $("cfile").disabled = running;
 
   const pill = $("runStatus");
   pill.textContent = STATUS_TEXT[state.status] || state.status;
@@ -200,6 +220,73 @@ $("cancelBtn").addEventListener("click", async () => {
     pollTimer = setInterval(refresh, 400);
   } catch (e) {
     setMsg("取消失败：" + e, "err");
+  }
+});
+
+// ---- 销售补正 -------------------------------------------------------------
+
+const RESULT_TEXT = { updated: "已更新", idempotent: "幂等跳过" };
+const REASON_TEXT = {
+  not_found: "销售行不存在",
+  stale_revision: "旧修订（已有更高修订）",
+  same_revision_different_amount: "同版异值",
+};
+
+function setCMsg(text, kind) {
+  const el = $("cmsg");
+  el.textContent = text || "";
+  el.className = kind || "";
+}
+
+function renderCorrection(data) {
+  const box = $("cresult");
+  if (data.status === "applied") {
+    const s = data.summary || {};
+    const rows = (data.rows || []).map((r) => `<tr>
+      <td>${r.line}</td><td>${r.sale_id}</td><td>${r.revision}</td>
+      <td>${r.amount}</td>
+      <td><span class="pill ${r.result}">${RESULT_TEXT[r.result] || r.result}</span></td>
+      <td>${r.previous_revision} / ${r.previous_amount}</td>
+    </tr>`).join("");
+    box.innerHTML = `<table><thead><tr>
+      <th>行号</th><th>sale_id</th><th>修订</th><th>金额</th><th>结果</th><th>原修订/原金额</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+    setCMsg(data.message || `补正完成：更新 ${s.updated ?? 0} 行，幂等跳过 ${s.idempotent ?? 0} 行。`, "ok");
+  } else if (data.status === "rejected") {
+    const rows = (data.conflicts || []).map((c) => `<tr>
+      <td>${c.line}</td><td>${c.sale_id}</td><td>${c.revision}</td>
+      <td>${c.amount}</td>
+      <td><span class="pill conflict">${REASON_TEXT[c.reason] || c.reason}</span></td>
+      <td>${c.current_revision ?? "—"} / ${c.current_amount ?? "—"}</td>
+      <td class="err">${c.message}</td>
+    </tr>`).join("");
+    box.innerHTML = `<table><thead><tr>
+      <th>行号</th><th>sale_id</th><th>提交修订</th><th>提交金额</th><th>冲突原因</th><th>当前修订/金额</th><th>说明</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+    setCMsg(data.message || "批次已整批拒绝，未修改任何数据。", "err");
+  } else {
+    box.innerHTML = "";
+    setCMsg(data.message || data.detail || "补正被拒绝。", "warn");
+  }
+}
+
+$("corrBtn").addEventListener("click", async () => {
+  const file = $("cfile").files[0];
+  if (!file) { setCMsg("请先选择补正 CSV 文件。", "err"); return; }
+  setCMsg("上传并应用补正中…");
+  $("cresult").innerHTML = "";
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const res = await fetch("/api/correction", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok && data.status !== "rejected" && data.status !== "busy") {
+      setCMsg("补正失败：" + (data.detail || res.status), "err");
+      return;
+    }
+    renderCorrection(data);
+  } catch (e) {
+    setCMsg("请求失败：" + e, "err");
   }
 });
 

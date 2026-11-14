@@ -112,6 +112,10 @@ class RunManager:
         self._templates = templates  # name -> SQL text
         self._lock = threading.RLock()
         self._run: Optional[Run] = None
+        # Site-wide mutual exclusion with sales-correction batches: while a
+        # batch holds this flag no replay round may start, and while a round
+        # is running no correction batch may begin.
+        self._correction_active = False
 
     # ---- public API used by the HTTP layer ----
 
@@ -119,10 +123,32 @@ class RunManager:
         with self._lock:
             if self._run is not None and self._run.status == "running":
                 raise RunConflict("A replay round is already running.")
+            if self._correction_active:
+                raise RunConflict(
+                    "A sales correction batch is in progress; "
+                    "the replay round was not started."
+                )
             run = Run(self._pool, self._templates, rows)
             self._run = run
         run.launch()
         return run.snapshot()
+
+    # ---- mutual exclusion with correction batches ----
+
+    def try_begin_correction(self) -> bool:
+        """Claim the correction slot; False while a replay round runs or
+        another correction batch is in progress."""
+        with self._lock:
+            if self._run is not None and self._run.status == "running":
+                return False
+            if self._correction_active:
+                return False
+            self._correction_active = True
+            return True
+
+    def end_correction(self) -> None:
+        with self._lock:
+            self._correction_active = False
 
     def cancel(self) -> dict:
         with self._lock:

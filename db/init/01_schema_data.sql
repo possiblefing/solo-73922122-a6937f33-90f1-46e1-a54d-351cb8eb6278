@@ -14,7 +14,9 @@ CREATE TABLE sales (
     qty          INTEGER      NOT NULL,
     unit_price   NUMERIC(10,2) NOT NULL,
     amount       NUMERIC(12,2) NOT NULL,
-    channel      TEXT         NOT NULL
+    channel      TEXT         NOT NULL,
+    -- 补正修订号：未补正的行一律为 0，补正只能以更高修订覆盖。
+    revision     INTEGER      NOT NULL DEFAULT 0
 );
 
 -- 200 stores x 100 days x 84 sales = 1,680,000 rows (~ a few hundred MB),

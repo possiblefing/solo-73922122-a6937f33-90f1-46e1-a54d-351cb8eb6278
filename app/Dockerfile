@@ -6,10 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+# Build context is the repository root (see docker-compose.yml) so the
+# bundled sample CSVs can be shipped inside the image at /samples.
+COPY app/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . /app
+COPY app/ /app/
+COPY samples/ /samples/
 
 EXPOSE 8000
 

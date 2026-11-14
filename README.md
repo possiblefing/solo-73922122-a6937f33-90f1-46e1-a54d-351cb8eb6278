@@ -1,9 +1,13 @@
-# 夜间门店日结 · 取数负载回放（FastAPI + psycopg + PostgreSQL）
+# 夜间门店日结 · 取数负载回放 + 销售补正（FastAPI + psycopg + PostgreSQL）
 
 重现夜间门店日结取数高峰，判断哪些取数请求需要错峰。上传由取数日志整理的
 CSV（最多 50 行，含相对到达毫秒、查询模板、门店号），系统严格按记录的间隔对
 PostgreSQL 发起**只读**查询，用一个上限为 **2 条连接**的连接池制造排队，
 并对每个请求执行 **3 秒硬性截止（含排队时间）**。
+
+数据工程师发现已入库销售金额有误时，可在网页上提交**销售补正**：上传最多
+20 行含 `sale_id、revision、amount` 的 CSV，系统按修订版本规则整批应用或
+整批拒绝，补正完成后即可重新回放查询昨日汇总。
 
 ## 快速开始
 
@@ -14,15 +18,27 @@ docker compose up --build
 
 浏览器打开 <http://localhost:8000>：
 
+**回放**
+
 1. 直接“下载样例 CSV”，或自备 CSV；
 2. 选择文件后点“开始回放”；
 3. 表格逐条刷新排队时长、执行时长、总耗时与状态（成功/超时/错误/已取消）；
 4. 运行中可随时点“取消整轮”；
 5. 整轮结束（完成或已取消）后才能启动下一轮。
 
+**销售补正**
+
+1. 点“下载补正样例 CSV”（`samples/correction.csv`，sale_id 200–219，
+   均为**昨日**销售，提交后门店 1–20 的昨日单日汇总即发生变化）；
+2. 选择补正 CSV 后点“提交补正”；
+3. 页面展示处理结果：成功时逐行列出“已更新/幂等跳过”及原值；
+   整批拒绝时逐行列出冲突行、冲突原因与库中当前修订/金额；
+4. 补正与回放互斥：回放进行中提交补正（或补正进行中启动回放）会直接
+   提示冲突，不进入排队。
+
 健康检查：`GET http://localhost:8000/api/health`
 
-## CSV 格式
+## 回放 CSV 格式
 
 表头必须包含三列（顺序不限，允许 `arrival`/`query_template`/`store_id` 等别名）：
 
@@ -39,7 +55,40 @@ arrival_ms,template,store
 - `store`：门店号；
 - 最多 **50** 行数据，超出或字段非法会返回 400 并说明行号。
 
-## 关键语义（与需求逐条对应）
+## 补正 CSV 格式
+
+表头必须包含三列（顺序不限，允许 `sale`/`rev` 别名）：
+
+```csv
+sale_id,revision,amount
+200,1,199.90
+201,1,88.00
+```
+
+- `sale_id`：正整数，必须对应**已有**销售行（补正只修改已有行）；
+- `revision`：正整数修订号；未补正过的行一律按修订 **0** 处理；
+- `amount`：非负、最多两位小数（如 `88`、`88.5`、`88.55` 合法，
+  `88.555`、`-1`、`1e3` 非法），且不超过 NUMERIC(12,2) 上限；
+- **金额与修订必须一起提交**，任一字段为空整行即非法；
+- 最多 **20** 行数据，同一批次内 `sale_id` 不得重复。
+
+## 补正版本语义（与需求逐条对应）
+
+| 需求 | 实现位置 / 做法 |
+| --- | --- |
+| 只修改已有销售行 | `UPDATE sales ... WHERE sale_id = %s`；行不存在 → 冲突 `not_found` |
+| 未补正的行按修订 0 处理 | `sales.revision INTEGER NOT NULL DEFAULT 0`（见 `db/init/01_schema_data.sql`） |
+| 更高修订才能覆盖 | `new_revision > stored_revision` 才执行 UPDATE |
+| 同版同金额重试返回成功 | 同修订且金额相等 → 幂等跳过，批次仍算成功（安全重试） |
+| 旧版 / 同版异值 / 找不到行 → 整批拒绝 | 逐行评估收集全部冲突行，发现任一冲突即回滚整个事务，HTTP 409 返回所有冲突行 |
+| 金额与修订须一起提交 | CSV 校验阶段强制两列同现，缺一直接 400 |
+| 并发上传不得让新版回退 | 单事务内 `SELECT ... FOR UPDATE` 行锁 + 仅允许更高修订覆盖；应用层互斥门同时只允许一批补正 |
+| 不留半批数据 | 整批一个事务，冲突即 ROLLBACK，全部更新原子提交或全部撤销 |
+| 补正与回放互斥 | `RunManager` 内的全站互斥门：回放运行中拒补正、补正进行中拒回放，冲突返回 409 并直接提示 |
+| 复用现有最多两条连接 | 补正与回放共用同一个 `ConnectionPool(min=max=2)`，不新建任何连接池 |
+| 回放仍执行只读模板 | 池连接会话级 `default_transaction_read_only = on` 保持不变；补正仅在自身事务内 `SET TRANSACTION READ WRITE` 临时放开，事务结束即失效 |
+
+## 回放引擎关键语义
 
 | 需求 | 实现位置 / 做法 |
 | --- | --- |
@@ -70,27 +119,39 @@ arrival_ms,template,store
 python3 -I tests/test_engine_fake.py
 ```
 
+补正语义用内存销售表覆盖（新版覆盖、幂等重试、旧版/同版异值/行不存在整批
+回滚、冲突行汇总、与回放互斥、并发补正互斥、CSV 校验）：
+
+```bash
+python3 -I tests/test_correction_fake.py
+```
+
 ## 目录结构
 
 ```
 .
 ├── docker-compose.yml
+├── .dockerignore               # 构建上下文为仓库根（样例 CSV 需打进镜像）
 ├── app/
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── main.py            # FastAPI 路由
-│   ├── engine.py          # 调度/排队/3秒截止/取消/连接回收
+│   ├── main.py            # FastAPI 路由（回放 + 补正）
+│   ├── engine.py          # 调度/排队/3秒截止/取消/连接回收/补正互斥门
+│   ├── correction.py      # 补正批次：版本规则、单事务、整批拒绝
 │   ├── db.py              # 两条连接的只读连接池 + 模板加载
-│   ├── csvutil.py         # CSV 解析与校验（≤50 行）
-│   └── static/index.html  # 单页前端
-├── db/init/01_schema_data.sql   # 表、168 万行虚构数据、两个查询模板
-├── samples/replay.csv          # 可直接上传的样例
-└── tests/test_engine_fake.py   # 引擎并发测试（标准库即可运行）
+│   ├── csvutil.py         # 回放/补正 CSV 解析与校验（≤50 / ≤20 行）
+│   └── static/index.html  # 单页前端（回放 + 补正入口与结果展示）
+├── db/init/01_schema_data.sql   # 表（含 revision 列）、168 万行虚构数据、两个查询模板
+├── samples/replay.csv           # 回放样例
+├── samples/correction.csv       # 补正样例（sale_id 200-219，影响昨日汇总）
+└── tests/
+    ├── test_engine_fake.py      # 引擎并发测试（标准库即可运行）
+    └── test_correction_fake.py  # 补正语义测试（标准库即可运行）
 ```
 
 ## 重置数据
 
 ```bash
-docker compose down -v   # 删除数据库卷
+docker compose down -v   # 删除数据库卷（补正记录一并清空）
 docker compose up --build
 ```

@@ -20,7 +20,8 @@ services:
 
   web:
     build:
-      context: ./app
+      context: .
+      dockerfile: app/Dockerfile
     container_name: replay-web
     depends_on:
       db:
