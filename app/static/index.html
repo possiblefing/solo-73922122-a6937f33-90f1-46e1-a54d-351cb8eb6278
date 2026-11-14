@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>夜间门店日结 · 负载回放</title>
+<style>
+  :root {
+    --bg:#0f172a; --panel:#1e293b; --line:#334155; --text:#e2e8f0;
+    --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e; --warn:#f59e0b;
+    --err:#ef4444; --cancel:#a855f7; --run:#38bdf8;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { padding:20px 28px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { margin:0 0 4px; font-size:20px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  main { padding:24px 28px; max-width:1180px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin-bottom:20px; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  input[type=file] { color:var(--muted); }
+  button { border:0; border-radius:8px; padding:9px 18px; font-size:14px; font-weight:600;
+           cursor:pointer; color:#0b1220; background:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button.danger { background:var(--err); color:#fff; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .hint { color:var(--muted); font-size:12px; margin-top:8px; }
+  .badges { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; }
+  .badge { padding:4px 12px; border-radius:999px; font-size:12px; font-weight:700;
+           border:1px solid var(--line); color:var(--muted); }
+  .badge b { color:var(--text); font-variant-numeric:tabular-nums; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:700; }
+  .pill.queued   { background:#334155; color:#cbd5e1; }
+  .pill.running  { background:rgba(56,189,248,.18); color:var(--run); }
+  .pill.success  { background:rgba(34,197,94,.18); color:var(--ok); }
+  .pill.timeout  { background:rgba(245,158,11,.18); color:var(--warn); }
+  .pill.error    { background:rgba(239,68,68,.18); color:var(--err); }
+  .pill.canceled { background:rgba(168,85,247,.18); color:var(--cancel); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:9px 10px; text-align:left; border-bottom:1px solid var(--line);
+           font-variant-numeric:tabular-nums; white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  td.err { white-space:normal; color:var(--muted); max-width:340px; }
+  tr.flash { animation:flash 1s ease; }
+  @keyframes flash { from { background:rgba(56,189,248,.18);} to { background:transparent;} }
+  .status-line { font-size:15px; margin-bottom:6px; }
+  .muted { color:var(--muted); }
+  #msg { margin-top:10px; font-size:13px; min-height:20px; }
+  #msg.err { color:var(--err); } #msg.ok { color:var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>夜间门店日结 · 取数负载回放</h1>
+  <p>上传取数日志 CSV（最多 50 行），按相对到达毫秒真实回放只读查询；全站同一时刻只跑一轮，连接池上限 2，单请求 3 秒（含排队）。</p>
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <input type="file" id="file" accept=".csv,text/csv" />
+      <button id="startBtn">开始回放</button>
+      <button id="cancelBtn" class="danger" disabled>取消整轮</button>
+      <a class="ghost" href="/samples/replay.csv" download style="padding:9px 14px;border:1px solid var(--line);border-radius:8px;">下载样例 CSV</a>
+    </div>
+    <div class="hint">列：<code>arrival_ms,template,store</code>；模板：<code>q1_daily_summary</code>（快）、<code>q2_settlement_audit</code>（慢，约 2–3 秒）。</div>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="status-line">轮次状态：<span id="runStatus" class="pill queued">空闲</span>
+      <span class="muted" id="timing"></span></div>
+    <div class="badges" id="badges"></div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>#</th><th>到达(ms)</th><th>模板</th><th>门店</th><th>状态</th>
+        <th>排队(ms)</th><th>执行(ms)</th><th>总耗时(ms)</th><th>行数</th><th>说明</th>
+      </tr></thead>
+      <tbody id="tbody"><tr><td colspan="10" class="muted">尚未开始。</td></tr></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const STATUS_TEXT = {
+  idle:"空闲", queued:"排队中", running:"执行中", success:"成功",
+  timeout:"超时", error:"错误", canceled:"已取消",
+  completed:"已完成", canceled_round:"已取消"
+};
+let pollTimer = null;
+let lastSignature = {};
+
+const $ = (id) => document.getElementById(id);
+
+function setMsg(text, kind) {
+  const el = $("msg");
+  el.textContent = text || "";
+  el.className = kind || "";
+}
+
+function render(state) {
+  const running = state.status === "running";
+  $("cancelBtn").disabled = !running;
+  $("startBtn").disabled = running;
+  $("file").disabled = running;
+
+  const pill = $("runStatus");
+  pill.textContent = STATUS_TEXT[state.status] || state.status;
+  pill.className = "pill " + (state.status === "completed" ? "success"
+      : state.status === "canceled" ? "canceled"
+      : state.status === "idle" ? "queued" : "running");
+
+  const s = state.stats || {};
+  $("badges").innerHTML = [
+    ["总请求", s.total], ["成功", s.success], ["超时", s.timeout],
+    ["错误", s.error], ["取消", s.canceled], ["执行中", s.in_flight],
+  ].map(([k,v]) => `<span class="badge">${k} <b>${v ?? 0}</b></span>`).join("");
+
+  const cfg = state.config || {};
+  $("timing").textContent = cfg.max_connections
+    ? ` · 连接上限 ${cfg.max_connections} · 单请求截止 ${cfg.deadline_seconds}s · 服务端 statement_timeout ${cfg.statement_timeout_ms}ms`
+    : "";
+
+  const tbody = $("tbody");
+  const reqs = state.requests || [];
+  if (!reqs.length) {
+    tbody.innerHTML = `<tr><td colspan="10" class="muted">尚未开始。</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = reqs.map((r) => {
+    const sig = r.status + "|" + (r.queue_ms ?? "") + "|" + (r.exec_ms ?? "") + "|" + (r.total_ms ?? "");
+    const changed = lastSignature[r.id] !== sig;
+    lastSignature[r.id] = sig;
+    const dash = (v) => v === null || v === undefined ? "—" : v;
+    return `<tr class="${changed ? "flash" : ""}">
+      <td>${r.id}</td>
+      <td>${r.arrival_ms}</td>
+      <td>${r.template}</td>
+      <td>${r.store}</td>
+      <td><span class="pill ${r.status}">${STATUS_TEXT[r.status] || r.status}</span></td>
+      <td>${dash(r.queue_ms)}</td>
+      <td>${dash(r.exec_ms)}</td>
+      <td>${dash(r.total_ms)}</td>
+      <td>${dash(r.rows)}</td>
+      <td class="err">${r.error ?? ""}</td>
+    </tr>`;
+  }).join("");
+
+  if (!running) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    setMsg(state.status === "completed"
+      ? "整轮已完成：所有 SQL 已结束、连接已归还。"
+      : "整轮已取消：在途 SQL 已停止、事务已清理、连接已归还。",
+      state.status === "completed" ? "ok" : "");
+  }
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/state");
+    render(await res.json());
+  } catch (e) {
+    setMsg("状态轮询失败：" + e, "err");
+  }
+}
+
+$("startBtn").addEventListener("click", async () => {
+  const file = $("file").files[0];
+  if (!file) { setMsg("请先选择 CSV 文件。", "err"); return; }
+  setMsg("上传并启动中…");
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const res = await fetch("/api/run", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) { setMsg("启动失败：" + (data.detail || res.status), "err"); return; }
+    lastSignature = {};
+    setMsg("回放进行中…");
+    render(data);
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(refresh, 400);
+  } catch (e) {
+    setMsg("请求失败：" + e, "err");
+  }
+});
+
+$("cancelBtn").addEventListener("click", async () => {
+  $("cancelBtn").disabled = true;
+  setMsg("正在取消：等待在途 SQL 停止与连接清理…");
+  try {
+    const res = await fetch("/api/cancel", { method: "POST" });
+    render(await res.json());
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    // Keep polling briefly until the finalizer reports the terminal state.
+    pollTimer = setInterval(refresh, 400);
+  } catch (e) {
+    setMsg("取消失败：" + e, "err");
+  }
+});
+
+refresh();
+</script>
+</body>
+</html>

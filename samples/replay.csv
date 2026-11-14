@@ -1,0 +1,13 @@
+arrival_ms,template,store
+0,q2_settlement_audit,1
+0,q2_settlement_audit,2
+100,q2_settlement_audit,3
+200,q1_daily_summary,4
+300,q2_settlement_audit,5
+400,q1_daily_summary,6
+600,q2_settlement_audit,7
+800,q1_daily_summary,8
+1200,q2_settlement_audit,9
+1600,q1_daily_summary,10
+2200,q2_settlement_audit,11
+3000,q1_daily_summary,12
